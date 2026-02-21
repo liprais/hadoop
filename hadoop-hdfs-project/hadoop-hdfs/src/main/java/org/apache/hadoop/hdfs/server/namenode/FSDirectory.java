@@ -167,6 +167,23 @@ public class FSDirectory implements Closeable {
   private long yieldCount = 0; // keep track of lock yield count.
   private int quotaInitThreads;
 
+  /**
+   * Pluggable INode storage back-end.
+   * Accessed as a static so that {@link INodeDirectory} can call it without
+   * holding a reference to the {@link FSDirectory} instance.
+   * Package-private for testing.
+   */
+  @VisibleForTesting
+  static volatile INodeStore iNodeStore = null;
+
+  /**
+   * Return the active {@link INodeStore}, or {@code null} if none is
+   * configured (in-memory default).
+   */
+  static INodeStore getINodeStore() {
+    return iNodeStore;
+  }
+
   private final int inodeXAttrsLimit; //inode xattrs max limit
 
   // A set of directories that have been protected using the
@@ -323,6 +340,16 @@ public class FSDirectory implements Closeable {
     this.inodeId = new INodeId();
     rootDir = createRoot(ns);
     inodeMap = INodeMap.newInstance(rootDir);
+
+    // Initialise pluggable INode store.  For the default in-memory case this
+    // is a thin wrapper around the INodeMap; for PostgreSQL or other external
+    // stores it connects to the database.
+    INodeStore store = INodeStoreFactory.create(conf);
+    if (store instanceof InMemoryINodeStore) {
+      ((InMemoryINodeStore) store).setINodeMap(inodeMap);
+    }
+    iNodeStore = store;
+    LOG.info("INodeStore implementation: {}", store.getClass().getName());
     this.isPermissionEnabled = conf.getBoolean(
       DFSConfigKeys.DFS_PERMISSIONS_ENABLED_KEY,
       DFSConfigKeys.DFS_PERMISSIONS_ENABLED_DEFAULT);
@@ -671,7 +698,20 @@ public class FSDirectory implements Closeable {
    * Shutdown the filestore
    */
   @Override
-  public void close() throws IOException {}
+  public void close() throws IOException {
+    INodeStore store = iNodeStore;
+    if (store != null) {
+      try {
+        store.close();
+      } catch (IOException e) {
+        LOG.warn("Error closing INodeStore", e);
+      }
+      // Do not set iNodeStore to null: INodeDirectory.addChild/removeChild hold
+      // local references from getINodeStore() before the null-check, so clearing
+      // the static field here could cause NullPointerExceptions in concurrent
+      // threads.  The store's own close() method handles cleanup safely.
+    }
+  }
 
   void markNameCacheInitialized() {
     writeLock();
@@ -1513,6 +1553,18 @@ public class FSDirectory implements Closeable {
           addStoragePolicySatisfier((INodeWithAdditionalFields) inode, xaf);
         }
       }
+      // For external INodeStore implementations the inode was already written
+      // in INodeDirectory.addChild().  We call put() here as well to handle
+      // inodes that are added directly (e.g. root, snapshot references).
+      if (iNodeStore != null && iNodeStore.isInitialized()
+          && !(iNodeStore instanceof InMemoryINodeStore)) {
+        try {
+          iNodeStore.put(inode);
+        } catch (IOException e) {
+          LOG.warn("Failed to persist inode {} to INodeStore in addToInodeMap",
+              inode.getId(), e);
+        }
+      }
     }
   }
 
@@ -1574,6 +1626,18 @@ public class FSDirectory implements Closeable {
         if (inode != null && inode instanceof INodeWithAdditionalFields) {
           inodeMap.remove(inode);
           ezManager.removeEncryptionZone(inode.getId());
+          // Also remove from external INodeStore (write-through).
+          // Note: INodeDirectory.removeChild() also calls store.remove()
+          // for children; this handles top-level and bulk-remove callers.
+          if (iNodeStore != null && iNodeStore.isInitialized()
+              && !(iNodeStore instanceof InMemoryINodeStore)) {
+            try {
+              iNodeStore.remove(inode.getId());
+            } catch (IOException e) {
+              LOG.warn("Failed to remove inode {} from INodeStore",
+                  inode.getId(), e);
+            }
+          }
         }
       }
     }
@@ -1605,6 +1669,15 @@ public class FSDirectory implements Closeable {
     try {
       rootDir = createRoot(getFSNamesystem());
       inodeMap.clear();
+      // Also clear the external store if configured.
+      if (iNodeStore != null && iNodeStore.isInitialized()
+          && !(iNodeStore instanceof InMemoryINodeStore)) {
+        try {
+          iNodeStore.clear();
+        } catch (IOException e) {
+          LOG.warn("Failed to clear INodeStore during reset", e);
+        }
+      }
       addToInodeMap(rootDir);
       nameCache.reset();
       inodeId.setCurrentValue(INodeId.LAST_RESERVED_ID);

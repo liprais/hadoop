@@ -65,13 +65,27 @@ public class INodeMap {
       map.put((INodeWithAdditionalFields)inode);
     }
   }
-  
+
+  /**
+   * Same as {@link #put(INode)} — exposed for {@link InMemoryINodeStore}.
+   */
+  final void putInternal(INode inode) {
+    put(inode);
+  }
+
   /**
    * Remove a {@link INode} from the map.
    * @param inode The {@link INode} to be removed.
    */
   public final void remove(INode inode) {
     map.remove(inode);
+  }
+
+  /**
+   * Same as {@link #remove(INode)} — exposed for {@link InMemoryINodeStore}.
+   */
+  final void removeInternal(INode inode) {
+    remove(inode);
   }
   
   /**

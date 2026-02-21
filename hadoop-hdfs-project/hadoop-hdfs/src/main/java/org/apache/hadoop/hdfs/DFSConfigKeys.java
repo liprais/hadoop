@@ -1079,6 +1079,17 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
   public static final String  DFS_NAMENODE_INODE_ATTRIBUTES_PROVIDER_KEY = "dfs.namenode.inode.attributes.provider.class";
   public static final String  DFS_NAMENODE_INODE_ATTRIBUTES_PROVIDER_BYPASS_USERS_KEY = "dfs.namenode.inode.attributes.provider.bypass.users";
   public static final String  DFS_NAMENODE_INODE_ATTRIBUTES_PROVIDER_BYPASS_USERS_DEFAULT = "";
+
+  /**
+   * Fully-qualified class name of the {@link INodeStore} implementation.
+   * When absent or empty, the default in-memory store is used.
+   *
+   * <p>Example: set to
+   * {@code org.apache.hadoop.hdfs.server.namenode.PostgreSQLINodeStore}
+   * to back the NameNode namespace metadata with PostgreSQL.
+   */
+  public static final String DFS_NAMENODE_INODE_STORE_CLASS_KEY =
+      "dfs.namenode.inode.store.class";
   public static final String  DFS_NAMENODE_LOCK_MODEL_PROVIDER_KEY =
       "dfs.namenode.lock.model.provider.class";
   public static final Class<? extends FSNLockManager>  DFS_NAMENODE_LOCK_MODEL_PROVIDER_DEFAULT =

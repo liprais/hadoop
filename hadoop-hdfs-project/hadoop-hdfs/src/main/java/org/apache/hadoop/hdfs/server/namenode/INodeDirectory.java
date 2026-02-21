@@ -18,6 +18,7 @@
 package org.apache.hadoop.hdfs.server.namenode;
 
 import java.io.FileNotFoundException;
+import java.io.IOException;
 import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -45,6 +46,8 @@ import org.apache.hadoop.hdfs.util.ReadOnlyList;
 import org.apache.hadoop.classification.VisibleForTesting;
 import org.apache.hadoop.util.Preconditions;
 import org.apache.hadoop.security.AccessControlException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import static org.apache.hadoop.hdfs.protocol.HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED;
 
@@ -53,6 +56,9 @@ import static org.apache.hadoop.hdfs.protocol.HdfsConstants.BLOCK_STORAGE_POLICY
  */
 public class INodeDirectory extends INodeWithAdditionalFields
     implements INodeDirectoryAttributes {
+
+  private static final Logger LOG =
+      LoggerFactory.getLogger(INodeDirectory.class);
 
   /** Cast INode to INodeDirectory. */
   public static INodeDirectory valueOf(INode inode, Object path
@@ -74,6 +80,23 @@ public class INodeDirectory extends INodeWithAdditionalFields
   static final byte[] ROOT_NAME = DFSUtil.string2Bytes("");
 
   private List<INode> children = null;
+
+  /**
+   * Flag indicating whether the {@link #children} list has been fully
+   * populated from the {@link INodeStore}.
+   *
+   * <ul>
+   *   <li>{@code true}: children are in-memory and authoritative.</li>
+   *   <li>{@code false}: children may only exist in the {@link INodeStore}
+   *       and will be loaded on first access.</li>
+   * </ul>
+   *
+   * With the default in-memory store this flag is always {@code true}.
+   * With an external store (e.g. PostgreSQL) the flag allows a directory's
+   * children to be evicted from the heap and reloaded on demand — the key
+   * mechanism for keeping NameNode memory usage constant as file count grows.
+   */
+  private volatile boolean childrenLoaded = true;
   
   /** constructor */
   public INodeDirectory(long id, byte[] name, PermissionStatus permissions,
@@ -494,8 +517,67 @@ public class INodeDirectory extends INodeWithAdditionalFields
   }
   
   private ReadOnlyList<INode> getCurrentChildrenList() {
+    if (!childrenLoaded) {
+      loadChildrenFromStore();
+    }
     return children == null ? ReadOnlyList.Util.<INode> emptyList()
         : ReadOnlyList.Util.asReadOnlyList(children);
+  }
+
+  /**
+   * Lazily load this directory's children from the external {@link INodeStore}.
+   *
+   * <p>Only called when {@link #childrenLoaded} is {@code false}, which means
+   * an external store is active and the in-memory children list has been
+   * evicted (or was never populated).  After a successful load,
+   * {@link #childrenLoaded} is set to {@code true}.
+   */
+  private synchronized void loadChildrenFromStore() {
+    if (childrenLoaded) {
+      return; // another thread loaded while we were waiting
+    }
+    INodeStore store = FSDirectory.getINodeStore();
+    if (store == null || !store.isInitialized()) {
+      childrenLoaded = true; // no store — treat current list as authoritative
+      return;
+    }
+    try {
+      List<INode> loaded = store.getChildren(getId());
+      if (!loaded.isEmpty()) {
+        children = new ArrayList<>(loaded.size());
+        for (INode child : loaded) {
+          child.setParent(this);
+          children.add(child);
+        }
+        // children from store are already sorted by local_name ascending
+      }
+      childrenLoaded = true;
+    } catch (IOException e) {
+      // Leave childrenLoaded = false so the next access retries.
+      // A persistent store error will log on every access; production code
+      // would add circuit-breaker / backoff logic here.
+      LOG.warn("Failed to load children of inode {} from INodeStore, "
+          + "will retry on next access", getId(), e);
+    }
+  }
+
+  /**
+   * Mark this directory's in-memory children list as dirty (not loaded).
+   * The next call to {@link #getCurrentChildrenList()} will trigger a reload
+   * from the {@link INodeStore}.
+   *
+   * <p>This method enables memory reclamation: the NameNode can drop the
+   * in-memory list of a cold directory, allowing the GC to reclaim that
+   * memory.  When the directory is accessed again the children are reloaded
+   * from the external store on demand.
+   */
+  public synchronized void evictChildren() {
+    INodeStore store = FSDirectory.getINodeStore();
+    if (store != null && store.isInitialized()
+        && !(store instanceof InMemoryINodeStore)) {
+      this.children = null;
+      this.childrenLoaded = false;
+    }
   }
 
   /**
@@ -546,6 +628,17 @@ public class INodeDirectory extends INodeWithAdditionalFields
 
     final INode removed = children.remove(i);
     Preconditions.checkState(removed.equals(child));
+
+    // Remove from external INodeStore (write-through).
+    INodeStore store = FSDirectory.getINodeStore();
+    if (store != null && store.isInitialized()
+        && !(store instanceof InMemoryINodeStore)) {
+      try {
+        store.remove(child.getId());
+      } catch (IOException e) {
+        LOG.warn("Failed to remove inode {} from INodeStore", child.getId(), e);
+      }
+    }
     return true;
   }
 
@@ -620,6 +713,20 @@ public class INodeDirectory extends INodeWithAdditionalFields
 
     if (node.getGroupName() == null) {
       node.setGroup(getGroupName());
+    }
+
+    // Persist to external INodeStore (write-through).
+    INodeStore store = FSDirectory.getINodeStore();
+    if (store != null && store.isInitialized()
+        && !(store instanceof InMemoryINodeStore)) {
+      try {
+        store.put(node);
+      } catch (IOException e) {
+        // Log and continue — the NameNode should not crash due to a store
+        // write failure during normal operation.  Durability of the namespace
+        // is still guaranteed by the edit log.
+        LOG.warn("Failed to persist inode {} to INodeStore", node.getId(), e);
+      }
     }
   }
 
